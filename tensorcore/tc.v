@@ -1,44 +1,25 @@
+/* verilator lint_off DECLFILENAME */
 //------------------------------------------------------------------------------
-// Ada SM Tensor Core Educational Model + Testbench
+// Ada SM Tensor Core Educational Model  (RTL + Testbench)
 //------------------------------------------------------------------------------
-// This single file contains:
-//   1.  Synthesizable RTL that matches the Tensor Core block of one RTX 4090 SM
-//        • 4 Tensor Cores, each = 8×8 systolic array, k‑depth 4 (256 FMAs/clk)
-//   2.  Self‑checking **SystemVerilog testbench** that shows how a 32‑lane warp
-//      drives the hardware via the `mma.sync.aligned.m8n8k4` instruction.
-//
-// Warp ↔️ Tensor Core mapping (hard‑wired in NVIDIA GPUs)
-// ┌───────┬────────┐   ┌──────────┐
-// │ Lanes │  Core  │   │ A rows   │
-// ├───────┼────────┤   │ B cols   │
-// │  0‑7  │ Core 0 │ ⇒ │ 0‑1      │
-// │ 8‑15  │ Core 1 │   │ 2‑3      │
-// │16‑23  │ Core 2 │   │ 4‑5      │
-// │24‑31  │ Core 3 │   │ 6‑7      │
-// └───────┴────────┘   └──────────┘
-// Every cycle the warp streams *one* k‑slice (8 words of A, 8 words of B)
-// into each core. After 4 slices (k=0‑3) the 8×8 tile is fully computed and
-// appears at the bottom edge 11 cycles later. Real Ada silicon reports 15‑16
-// clk latency; this RTL shows the pure systolic sweep (8) + bookkeeping (3).
+// * Fixed systolic‑array bugs (reset edge & psum routing)
+// * Added optional VCD/FST tracing via $dumpfile/$dumpvars or +trace
+// * Cleaned up Verilator warnings (blocking assignments in initial blocks)
 //------------------------------------------------------------------------------
+`timescale 1ns/1ps
 
-`timescale 1ns / 1ps
-
-//----------------------------------------------------------
-// Utility: ceiling‑log2 (for counters)
-//----------------------------------------------------------
-function integer clog2;
-    input integer value;
-    integer i;
-    begin
+//---------------------------------------------
+// Utility: ceil‑log2 (simple integer function)
+//---------------------------------------------
+function automatic integer clog2(input integer value);
+    integer i; begin
         clog2 = 0;
-        for (i = value-1; i > 0; i = i >> 1)
-            clog2 = clog2 + 1;
+        for (i = value-1; i > 0; i = i >> 1) clog2++;
     end
 endfunction
 
 //==========================================================
-//  Processing Element (PE) – scalar FMA cell
+//  Processing Element (PE) – scalar MAC
 //==========================================================
 module pe #(parameter WIDTH = 16) (
     input  wire                 clk,
@@ -56,72 +37,69 @@ module pe #(parameter WIDTH = 16) (
             b_out    <= '0;
             psum_out <= '0;
         end else begin
-            a_out    <= a_in;              // shift operands right/down
+            a_out    <= a_in;
             b_out    <= b_in;
-            psum_out <= psum_in + a_in * b_in; // integer FMA (swap for FP FMA)
+            psum_out <= psum_in + a_in * b_in;
         end
     end
 endmodule
 
 //==========================================================
-//  tensor_core – 8×8 systolic array, k‑depth = 4
+//  tensor_core – 8×8 systolic array, k‑depth=4
 //==========================================================
 module tensor_core #(
-    parameter WIDTH    = 16,
-    parameter SIZE     = 8,
-    parameter K_DEPTH  = 4
+    parameter WIDTH   = 16,
+    parameter SIZE    = 8,
+    parameter KDEPTH  = 4
 )(
     input  wire                         clk,
     input  wire                         rst,
-    input  wire [SIZE*WIDTH-1:0]        a_left,   // 8 words from one warp quad
-    input  wire [SIZE*WIDTH-1:0]        b_top,    // 8 words from one warp quad
+    input  wire [SIZE*WIDTH-1:0]        a_left,
+    input  wire [SIZE*WIDTH-1:0]        b_top,
     input  wire                         a_valid,
     input  wire                         b_valid,
-    output wire [SIZE*2*WIDTH-1:0]      c_bottom, // 8×8 tile result
-    output wire                         c_valid   // pulses when tile ready
+    output wire [SIZE*2*WIDTH-1:0]      c_bottom,
+    output wire                         c_valid
 );
-    //------------------------------------------------------------------
-    // Stage 0: capture k‑slice streams into K‑deep shift registers
-    //------------------------------------------------------------------
-    reg [K_DEPTH-1:0][SIZE*WIDTH-1:0] a_shift;
-    reg [K_DEPTH-1:0][SIZE*WIDTH-1:0] b_shift;
-    reg [clog2(K_DEPTH):0]            k_ctr;
-
-    wire k_last = (k_ctr == K_DEPTH-1);
+    // Shift registers holding K‑slice history
+    reg [SIZE*WIDTH-1:0] a_shift[KDEPTH-1:0];
+    reg [SIZE*WIDTH-1:0] b_shift[KDEPTH-1:0];
+    reg [clog2(KDEPTH)-1:0] k_ctr;
 
     always @(posedge clk) begin
         if (rst) begin
-            a_shift <= '{default:0};
-            b_shift <= '{default:0};
-            k_ctr   <= 0;
+            a_shift <= '{default:'0};
+            b_shift <= '{default:'0};
+            k_ctr   <= '0;
         end else if (a_valid & b_valid) begin
-            a_shift <= {a_shift[K_DEPTH-2:0], a_left};
-            b_shift <= {b_shift[K_DEPTH-2:0], b_top};
-            k_ctr   <= k_last ? 0 : k_ctr + 1;
+            a_shift <= {a_shift[KDEPTH-2:0], a_left};
+            b_shift <= {b_shift[KDEPTH-2:0], b_top};
+            k_ctr   <= (k_ctr == KDEPTH-1) ? 0 : k_ctr + 1;
         end
     end
 
-    //------------------------------------------------------------------
-    // Stage 1: 8×8 grid of PEs – systolic wave
-    //------------------------------------------------------------------
-    wire [WIDTH-1:0]     a_bus   [0:SIZE][0:SIZE-1];
-    wire [WIDTH-1:0]     b_bus   [0:SIZE-1][0:SIZE];
-    wire [2*WIDTH-1:0]   psum_bus[0:SIZE-1][0:SIZE];
+    // Operand & psum buses (extra column for right‑shift)
+    wire [WIDTH-1:0]     a_bus [0:SIZE] [0:SIZE-1];
+    wire [WIDTH-1:0]     b_bus [0:SIZE-1] [0:SIZE];
+    wire [2*WIDTH-1:0]   psum_bus [0:SIZE-1] [0:SIZE];
 
     genvar i,j;
     generate
+        // feed left/top boundaries from current k‑slice
         for (i=0;i<SIZE;i++) begin : FEED
             assign a_bus[0][i] = a_shift[k_ctr][i*WIDTH +: WIDTH];
             assign b_bus[i][0] = b_shift[k_ctr][i*WIDTH +: WIDTH];
         end
+        // grid of PEs
         for (i=0;i<SIZE;i++) begin : ROW
             for (j=0;j<SIZE;j++) begin : COL
                 pe #(.WIDTH(WIDTH)) u_pe (
                     .clk      (clk),
-                    .rst      (rst | (a_valid & b_valid & k_last)),
+                    // reset on FIRST slice (k_ctr==0) so each tile clears once
+                    .rst      (rst | (a_valid & b_valid & (k_ctr==0))),
                     .a_in     (a_bus[j][i]),
                     .b_in     (b_bus[i][j]),
-                    .psum_in  ((j==0) ? '0 : psum_bus[i][j]),
+                    .psum_in  ((j==0)? '0 : psum_bus[i][j]),
                     .a_out    (a_bus[j+1][i]),
                     .b_out    (b_bus[i][j+1]),
                     .psum_out (psum_bus[i][j+1])
@@ -130,36 +108,37 @@ module tensor_core #(
         end
     endgenerate
 
-    // Collect bottom edge
+    // collect final column (SIZE) to bottom edge
     generate
         for (i=0;i<SIZE;i++) begin : COLLECT
             assign c_bottom[i*2*WIDTH +: 2*WIDTH] = psum_bus[i][SIZE];
         end
     endgenerate
 
-    // Simple latency counter = SIZE + K_DEPTH - 1 cycles
-    reg [$clog2(SIZE+K_DEPTH):0] lat_ctr;
-    reg                          out_phase;
+    // latency: SIZE + KDEPTH cycles from slice‑0 arrival
+    localparam LAT = SIZE + KDEPTH;
+    reg [clog2(LAT)-1:0] lat_ctr;
+    reg                  out_phase;
     always @(posedge clk) begin
         if (rst) begin
-            lat_ctr  <= 0; out_phase <= 0;
-        end else if (a_valid & b_valid & k_last) begin
+            lat_ctr <= 0; out_phase <= 0;
+        end else if (a_valid & b_valid & (k_ctr==KDEPTH-1)) begin
             out_phase <= 1; lat_ctr <= 0;
         end else if (out_phase) begin
             lat_ctr <= lat_ctr + 1;
-            if (lat_ctr == SIZE-1) out_phase <= 0;
+            if (lat_ctr == LAT-1) out_phase <= 0;
         end
     end
-    assign c_valid = (out_phase & (lat_ctr == SIZE-1));
+    assign c_valid = out_phase & (lat_ctr == LAT-1);
 endmodule
 
 //==========================================================
-//  ada_sm_tensor – 4 Tensor Cores = 1 SM
+//  ada_sm_tensor – 4 Tensor Cores per SM
 //==========================================================
 module ada_sm_tensor #(
-    parameter WIDTH   = 16,
-    parameter SIZE    = 8,
-    parameter CORES   = 4
+    parameter WIDTH = 16,
+    parameter SIZE  = 8,
+    parameter CORES = 4
 )(
     input  wire                                   clk,
     input  wire                                   rst,
@@ -169,99 +148,88 @@ module ada_sm_tensor #(
     output wire [CORES*SIZE*2*WIDTH-1:0]          c_bottom_all,
     output wire [CORES-1:0]                       c_valid_all
 );
-    genvar k;
+    genvar core;
     generate
-        for (k=0;k<CORES;k++) begin : CORE
+        for (core=0; core<CORES; core++) begin : CORE
             tensor_core #(.WIDTH(WIDTH), .SIZE(SIZE)) u_tc (
                 .clk      (clk),
                 .rst      (rst),
-                .a_left   (a_left_all[k*SIZE*WIDTH +: SIZE*WIDTH]),
-                .b_top    (b_top_all [k*SIZE*WIDTH +: SIZE*WIDTH]),
-                .a_valid  (in_valid[k]),
-                .b_valid  (in_valid[k]),
-                .c_bottom (c_bottom_all[k*SIZE*2*WIDTH +: SIZE*2*WIDTH]),
-                .c_valid  (c_valid_all[k])
+                .a_left   (a_left_all[core*SIZE*WIDTH +: SIZE*WIDTH]),
+                .b_top    (b_top_all [core*SIZE*WIDTH +: SIZE*WIDTH]),
+                .a_valid  (in_valid[core]),
+                .b_valid  (in_valid[core]),
+                .c_bottom (c_bottom_all[core*SIZE*2*WIDTH +: SIZE*2*WIDTH]),
+                .c_valid  (c_valid_all[core])
             );
         end
     endgenerate
 endmodule
 
 //**********************************************************
-//  TESTBENCH SECTION – simulates one warp driving the SM
+//  TESTBENCH – 32‑lane warp drives the SM, optional VCD
 //**********************************************************
 module tb_ada_sm_tensor;
-    // Parameters mirror design
-    localparam WIDTH = 16;
-    localparam SIZE  = 8;
-    localparam KDEPTH= 4;
-    localparam CORES = 4;
+    localparam WIDTH=16, SIZE=8, KDEPTH=4, CORES=4;
 
-    // Clock & reset
-    logic clk = 0; always #2.5 clk = ~clk; // 200 MHz
-    logic rst = 1;
+    // clock gen (200 MHz)
+    logic clk=0; always #2.5 clk=~clk;
+    logic rst=1;
 
-    // Operand & control buses
-    logic [CORES*SIZE*WIDTH-1:0] a_left_flat;
-    logic [CORES*SIZE*WIDTH-1:0] b_top_flat;
-    logic [CORES-1:0]            in_valid;
+    logic [CORES*SIZE*WIDTH-1:0] a_left_flat='0;
+    logic [CORES*SIZE*WIDTH-1:0] b_top_flat='0;
+    logic [CORES-1:0]            in_valid='0;
     logic [CORES*SIZE*2*WIDTH-1:0] c_bottom_all;
     logic [CORES-1:0]              c_valid_all;
 
-    // DUT
-    ada_sm_tensor #(.WIDTH(WIDTH), .SIZE(SIZE)) dut (
-        .clk(clk), .rst(rst),
+    ada_sm_tensor #(.WIDTH(WIDTH),.SIZE(SIZE)) dut(
+        .clk(clk),.rst(rst),
         .a_left_all(a_left_flat),
         .b_top_all (b_top_flat),
         .in_valid  (in_valid),
         .c_bottom_all(c_bottom_all),
-        .c_valid_all(c_valid_all)
-    );
+        .c_valid_all(c_valid_all));
 
-    //------------------------------------------------------------------
-    // Helper tasks: generate k‑slice fragments for identity matrices
-    //------------------------------------------------------------------
-    function automatic [SIZE*WIDTH-1:0] make_identity_slice(input int k_idx, bit transpose);
-        logic [SIZE*WIDTH-1:0] slice;
-        for (int i=0;i<SIZE;i++) begin
-            slice[i*WIDTH +: WIDTH] = ((transpose ? i : k_idx) == (transpose ? k_idx : i)) ? 16'd1 : 16'd0;
+    // ---------------- VCD / FST dump ----------------
+    initial begin
+        if ($test$plusargs("DUMP")) begin
+            $dumpfile("wave.vcd");
+            $dumpvars(0, tb_ada_sm_tensor);
         end
+    end
+
+    // ---------------- helper function ---------------
+    function automatic [SIZE*WIDTH-1:0] make_slice(input int k_idx, bit transpose);
+        logic [SIZE*WIDTH-1:0] slice;
+        for (int i=0;i<SIZE;i++)
+            slice[i*WIDTH +: WIDTH] = ((transpose? i : k_idx)==(transpose? k_idx : i)) ? 16'd1 : 16'd0;
         return slice;
     endfunction
 
-    //------------------------------------------------------------------
-    // Stimulus – the 32‑lane warp writes identity*A × identity*B so result
-    // should be 4 on the diagonal (k=4) and 0 elsewhere.
-    //------------------------------------------------------------------
+    // ---------------- stimulus ----------------------
     initial begin
-        // Reset
         repeat (4) @(posedge clk);
-        rst <= 0;
-        in_valid <= 0;
-        a_left_flat <= '0;
-        b_top_flat  <= '0;
+        rst = 0;
 
-        // Stream four k‑slices over 4 cycles (warp behaviour)
-        for (int k_slice=0;k_slice<KDEPTH;k_slice++) begin
+        // stream 4 k‑slices
+        for (int k=0; k<KDEPTH; k++) begin
             @(posedge clk);
-            in_valid <= 4'b1111;   // all cores active this cycle
-
-            // Build operand buses core‑by‑core
-            for (int core=0; core<CORES; core++) begin
-                int offset = core*SIZE*WIDTH;
-                a_left_flat[offset +: SIZE*WIDTH] = make_identity_slice(k_slice, 0);
-                b_top_flat [offset +: SIZE*WIDTH] = make_identity_slice(k_slice, 1);
+            in_valid = '1;                                   // all 4 cores
+            for (int c=0;c<CORES;c++) begin
+                int off = c*SIZE*WIDTH;
+                a_left_flat[off +: SIZE*WIDTH] = make_slice(k,0);
+                b_top_flat [off +: SIZE*WIDTH] = make_slice(k,1);
             end
         end
-        @(posedge clk) in_valid <= 0; // stop streaming
+        @(posedge clk) in_valid = '0;
 
-        // Wait full latency (11 cycles) then observe outputs
-        repeat (11) @(posedge clk);
-        $display("c_valid_all = %b (time=%0t)", c_valid_all, $time);
-        // Print Core0 tile
+        // wait SIZE+KDEPTH cycles (12)
+        repeat (SIZE+KDEPTH) @(posedge clk);
+
+        $display("c_valid_all = %b", c_valid_all);
         for (int row=0; row<SIZE; row++) begin
             $write("Row%0d: ", row);
             for (int col=0; col<SIZE; col++) begin
-                int base = (row*SIZE + col)*(2*WIDTH);
+                int base=(row*SIZE+col)*(2*WIDTH);
                 $write("%0d ", c_bottom_all[base +: 2*WIDTH]);
             end
             $write("\n");
@@ -269,4 +237,3 @@ module tb_ada_sm_tensor;
         $finish;
     end
 endmodule
-

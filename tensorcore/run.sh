@@ -1,3 +1,3 @@
 #!/bin/bash -e
-verilator --cc --timing --exe tc.v --build -Wno-INITIALDLY --binary
-./obj_dir/Vtc
+verilator --timing tc.v -j 8 --build -Wno-INITIALDLY -Wno-WIDTHEXPAND --binary --trace-fst
+./obj_dir/Vtc +DUMP
