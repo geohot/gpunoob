@@ -1,5 +1,5 @@
 // dims = G*L (g*num_threads + l)
-//            OpenCL        CUDA       HIP
+//            OpenCL        CUDA       HIP                  Metal
 // G cores   (get_group_id, blockIdx,  __ockl_get_group_id, threadgroup_position_in_grid)
 // L threads (get_local_id, threadIdx, __ockl_get_local_id, thread_position_in_threadgroup)
 
@@ -12,7 +12,7 @@
 // On NVIDIA, cores are streaming multiprocessors.
 //   AD102 (4090) has 144 SMs with 128 threads each
 // On AMD, cores are compute units.
-//   7900XTX has 96 CUs with with 64 threads each
+//   7900XTX has 96 CUs with 64 threads each
 // On Apple, ???
 //   M3 Max has a 40 core GPU, 640 "Execution Units", 5120 "ALUs"
 //   Measured. 640 EUs with 32 threads each (20480 threads total)
